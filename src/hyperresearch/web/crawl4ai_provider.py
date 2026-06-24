@@ -9,9 +9,13 @@ Supports authenticated crawling via crawl4ai browser profiles:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import os
 import pathlib
+import shutil
+import socket
 import sys
+import tempfile
 from datetime import UTC, datetime
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, DefaultMarkdownGenerator
@@ -31,6 +35,86 @@ if sys.platform == "win32":
                 _stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+
+
+# Chromium permits only ONE live process per user_data_dir. When several fetcher
+# processes share one authenticated profile (the parallel-research topology) every
+# browser aborts at launch ("Connection closed while reading from the driver" /
+# net::ERR_ABORTED), collapsing the whole run to no-fetch. Cloning the profile to a
+# unique per-process dir keeps the auth state (cookies/localStorage) while giving
+# each process its own dir, so there is no contention. Cache/transient dirs are
+# skipped — chromium rebuilds them, and they dominate a profile's size.
+_PROFILE_CLONE_IGNORE = shutil.ignore_patterns(
+    "Singleton*",
+    "lockfile",
+    "*.lock",
+    "Code Cache",
+    "GPUCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+    "GrShaderCache",
+    "ShaderCache",
+    "component_crx_cache",
+    "Crashpad",
+    "BrowserMetrics*",
+    "OptimizationGuide*",
+    "Safe Browsing",
+)
+
+
+def _free_port() -> int:
+    """Return an ephemeral free TCP port for this process's CDP endpoint.
+
+    Managed-browser mode pins a fixed remote-debugging port (9222). Concurrent
+    fetcher processes would otherwise collide on it ("CDP endpoint not ready" /
+    silently attaching to a sibling's browser). A unique port per process gives
+    each its own isolated chromium, complementing the per-process profile clone.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _clone_profile_dir(src: str) -> str:
+    """Copy an auth profile to a fresh per-process user_data_dir; return its path.
+
+    The clone preserves login state but not the single-process lock, so concurrent
+    fetcher processes never collide on one chromium profile. Registered for cleanup
+    at interpreter exit (the fetcher process is short-lived).
+    """
+    dst = tempfile.mkdtemp(prefix="hpr-prof-")
+    shutil.copytree(src, dst, dirs_exist_ok=True, ignore=_PROFILE_CLONE_IGNORE, symlinks=True)
+    # Strip any singleton/lock artifacts that slipped through so the clone is clean.
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
+        p = pathlib.Path(dst) / name
+        try:
+            if p.is_symlink() or p.exists():
+                p.unlink()
+        except OSError:
+            pass
+    atexit.register(shutil.rmtree, dst, ignore_errors=True)
+    return dst
+
+
+# Substrings that mark a dead/lost browser driver — distinct from a clean per-site
+# block (Cloudflare/anti-bot) or a normal nav timeout. Only these are retried.
+_DRIVER_DEATH_MARKERS = (
+    "connection closed",
+    "err_aborted",
+    "target closed",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "browser closed",
+    "has crashed",
+    "websocket",
+)
+_MAX_DRIVER_RETRIES = 2
+
+
+def _is_driver_death(detail: object) -> bool:
+    """True if the error text looks like the browser driver died (retryable)."""
+    s = str(detail).lower()
+    return any(m in s for m in _DRIVER_DEATH_MARKERS)
 
 
 def _is_pdf_url(url: str) -> bool:
@@ -155,6 +239,17 @@ class Crawl4AIProvider:
         if profile and not data_dir:
             data_dir = str(pathlib.Path.home() / ".crawl4ai" / "profiles" / profile)
 
+        # Clone the auth profile to a unique per-process dir so concurrent fetcher
+        # processes don't collide on one chromium user_data_dir (the parallel-run
+        # crash). The source profile keeps the login session; the clone carries a
+        # copy of it. Fall through to the original path if cloning fails.
+        self._source_data_dir = data_dir
+        if data_dir and os.path.isdir(data_dir):
+            try:
+                data_dir = _clone_profile_dir(data_dir)
+            except OSError:
+                pass  # use the shared profile rather than fail outright
+
         self._data_dir = data_dir
         self._headless = headless
         self._cookies = cookies
@@ -163,6 +258,9 @@ class Crawl4AIProvider:
         if data_dir:
             browser_kwargs["use_managed_browser"] = True
             browser_kwargs["user_data_dir"] = data_dir
+            # Unique CDP port per process so parallel managed-browser fetchers don't
+            # collide on the default 9222 (the other half of parallel-fetch safety).
+            browser_kwargs["debugging_port"] = _free_port()
         if cookies:
             browser_kwargs["cookies"] = cookies
 
@@ -298,58 +396,85 @@ class Crawl4AIProvider:
             screenshot=screenshot_bytes,
         )
 
+    async def _arun_with_retry(self, url: str):
+        """Run a single browser fetch, retrying ONLY on browser-driver death.
+
+        A clean per-site block (Cloudflare/anti-bot) or a normal nav timeout is
+        returned as-is; a dead driver (connection closed / target closed / crash)
+        is retried with a fresh crawler, since one driver death would otherwise
+        sink the result for a transient reason.
+        """
+        result = None
+        for attempt in range(_MAX_DRIVER_RETRIES + 1):
+            try:
+                async with self._make_crawler() as crawler:
+                    result = await crawler.arun(url=url, config=self._run_config)
+            except Exception as e:
+                if attempt < _MAX_DRIVER_RETRIES and _is_driver_death(e):
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+            if (
+                not result.success
+                and attempt < _MAX_DRIVER_RETRIES
+                and _is_driver_death(result.error_message or "")
+            ):
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            return result
+        return result
+
     async def _fetch_async(self, url: str) -> WebResult:
-        async with self._make_crawler() as crawler:
-            result = await crawler.arun(url=url, config=self._run_config)
-            metadata = result.metadata or {}
+        result = await self._arun_with_retry(url)
+        metadata = result.metadata or {}
 
-            # result.markdown is a MarkdownGenerationResult with .raw_markdown,
-            # .fit_markdown, .markdown_with_citations, etc.
-            # Prefer fit_markdown (main content, no nav/footer chrome) over raw_markdown.
-            md = result.markdown
-            if md and hasattr(md, "fit_markdown"):
-                content = md.fit_markdown or md.raw_markdown or ""
-            elif md and hasattr(md, "raw_markdown"):
-                content = md.raw_markdown or ""
-            elif isinstance(md, str):
-                content = md
-            else:
-                content = ""
+        # result.markdown is a MarkdownGenerationResult with .raw_markdown,
+        # .fit_markdown, .markdown_with_citations, etc.
+        # Prefer fit_markdown (main content, no nav/footer chrome) over raw_markdown.
+        md = result.markdown
+        if md and hasattr(md, "fit_markdown"):
+            content = md.fit_markdown or md.raw_markdown or ""
+        elif md and hasattr(md, "raw_markdown"):
+            content = md.raw_markdown or ""
+        elif isinstance(md, str):
+            content = md
+        else:
+            content = ""
 
-            # Extract media (images) — crawl4ai returns dict with 'images' key
-            media_raw = result.media or {}
-            media = media_raw.get("images", []) if isinstance(media_raw, dict) else []
+        # Extract media (images) — crawl4ai returns dict with 'images' key
+        media_raw = result.media or {}
+        media = media_raw.get("images", []) if isinstance(media_raw, dict) else []
 
-            # Extract links — crawl4ai returns dict with 'internal'/'external' keys
-            links_raw = result.links or {}
-            links = []
-            if isinstance(links_raw, dict):
-                for link in links_raw.get("internal", []):
-                    links.append({**link, "type": "internal"})
-                for link in links_raw.get("external", []):
-                    links.append({**link, "type": "external"})
+        # Extract links — crawl4ai returns dict with 'internal'/'external' keys
+        links_raw = result.links or {}
+        links = []
+        if isinstance(links_raw, dict):
+            for link in links_raw.get("internal", []):
+                links.append({**link, "type": "internal"})
+            for link in links_raw.get("external", []):
+                links.append({**link, "type": "external"})
 
-            # Decode screenshot from base64 if present
-            screenshot_bytes = None
-            if result.screenshot:
-                import base64
+        # Decode screenshot from base64 if present
+        screenshot_bytes = None
+        if result.screenshot:
+            import base64
 
-                try:
-                    screenshot_bytes = base64.b64decode(result.screenshot)
-                except Exception:
-                    pass
+            try:
+                screenshot_bytes = base64.b64decode(result.screenshot)
+            except Exception:
+                pass
 
-            return WebResult(
-                url=result.url or url,
-                title=metadata.get("title", ""),
-                content=content,
-                raw_html=result.html,
-                fetched_at=datetime.now(UTC),
-                metadata=metadata,
-                media=media,
-                links=links,
-                screenshot=screenshot_bytes,
-            )
+        return WebResult(
+            url=result.url or url,
+            title=metadata.get("title", ""),
+            content=content,
+            raw_html=result.html,
+            fetched_at=datetime.now(UTC),
+            metadata=metadata,
+            media=media,
+            links=links,
+            screenshot=screenshot_bytes,
+        )
 
     def fetch_many(self, urls: list[str]) -> list[WebResult]:
         """Fetch multiple URLs concurrently using crawl4ai's arun_many."""
@@ -368,12 +493,24 @@ class Crawl4AIProvider:
             if pdf_result is not None:
                 web_results.append(pdf_result)
 
-        # Fetch HTML pages with browser
+        # Fetch HTML pages with browser — retry only URLs whose driver died
+        # (a clean per-site block stays failed; a dead driver gets another go).
         if html_urls:
-            async with self._make_crawler() as crawler:
-                results = await crawler.arun_many(urls=html_urls, config=self._run_config)
-                for cr, url in zip(results, html_urls, strict=False):
+            pending = list(html_urls)
+            for attempt in range(_MAX_DRIVER_RETRIES + 1):
+                retry_urls: list[str] = []
+                try:
+                    async with self._make_crawler() as crawler:
+                        results = await crawler.arun_many(urls=pending, config=self._run_config)
+                except Exception as e:
+                    if attempt < _MAX_DRIVER_RETRIES and _is_driver_death(e):
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        continue
+                    raise
+                for cr, url in zip(results, pending, strict=False):
                     if not cr.success:
+                        if attempt < _MAX_DRIVER_RETRIES and _is_driver_death(cr.error_message or ""):
+                            retry_urls.append(url)
                         continue
                     metadata = cr.metadata or {}
                     md = cr.markdown
@@ -415,6 +552,10 @@ class Crawl4AIProvider:
                         media=media,
                         screenshot=screenshot_bytes,
                     ))
+                if not retry_urls:
+                    break
+                pending = retry_urls
+                await asyncio.sleep(0.5 * (attempt + 1))
         return web_results
 
     def search(self, query: str, max_results: int = 5) -> list[WebResult]:
