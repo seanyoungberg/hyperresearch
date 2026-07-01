@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -144,7 +145,27 @@ class Vault:
 
     @staticmethod
     def discover(start: Path | None = None) -> Vault:
-        """Walk up from start (default: cwd) to find a vault root."""
+        """Find the vault root.
+
+        Resolution order:
+          1. ``HYPERRESEARCH_VAULT`` env var, if set — pins the vault root
+             explicitly and cwd-independently. This lets an agent launched
+             from any working directory target the same canonical vault, and
+             it wins over any stray ``.hyperresearch/`` marker in a
+             subdirectory (which would otherwise hijack discovery).
+          2. Walk up from ``start`` (default: cwd) to the first directory
+             containing a ``.hyperresearch/`` marker.
+        """
+        env_root = os.environ.get("HYPERRESEARCH_VAULT")
+        if env_root:
+            root = Path(env_root).expanduser().resolve()
+            if (root / HYPERRESEARCH_DIR).is_dir():
+                return Vault(root)
+            raise VaultError(
+                f"HYPERRESEARCH_VAULT={env_root} is not an initialized vault "
+                f"(no {HYPERRESEARCH_DIR}/ directory). "
+                f"Run 'hyperresearch init {env_root}' or unset the variable."
+            )
         current = (start or Path.cwd()).resolve()
         while True:
             if (current / HYPERRESEARCH_DIR).is_dir():
