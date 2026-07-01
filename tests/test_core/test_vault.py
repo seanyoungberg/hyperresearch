@@ -46,9 +46,27 @@ def test_discover_finds_vault(tmp_path: Path):
     assert found.root == vault.root
 
 
-def test_discover_raises_when_no_vault(tmp_path: Path):
+def test_discover_raises_when_no_vault(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("HYPERRESEARCH_VAULT", raising=False)
     with pytest.raises(VaultError, match="No hyperresearch vault"):
         Vault.discover(start=tmp_path)
+
+
+def test_discover_env_var_pins_vault(tmp_path: Path, monkeypatch):
+    """HYPERRESEARCH_VAULT pins the root cwd-independently and wins over a
+    stray .hyperresearch marker in the start directory."""
+    canonical = Vault.init(tmp_path / "canonical")
+    # A decoy vault the walk-up would otherwise find first.
+    decoy = Vault.init(tmp_path / "decoy")
+    monkeypatch.setenv("HYPERRESEARCH_VAULT", str(canonical.root))
+    found = Vault.discover(start=decoy.root)
+    assert found.root == canonical.root
+
+
+def test_discover_env_var_uninitialized_raises(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("HYPERRESEARCH_VAULT", str(tmp_path / "nope"))
+    with pytest.raises(VaultError, match="not an initialized vault"):
+        Vault.discover()
 
 
 def test_config_loaded(tmp_vault: Vault):
