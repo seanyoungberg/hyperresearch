@@ -69,9 +69,15 @@ class WebResult:
         if len(content.strip()) < 300:
             return "Empty or near-empty content"
 
-        # Cloudflare / bot detection pages
+        # Cloudflare / bot detection pages.
+        # NOTE: do NOT match the bare word "cloudflare" — it appears in the
+        # body of every legitimate cloudflare.com / developers.cloudflare.com /
+        # blog.cloudflare.com page and would false-positive the entire domain
+        # as a bot-challenge. The phrases below only appear on actual CF
+        # interstitial / challenge pages ("Attention Required! | Cloudflare",
+        # "Just a moment...", "Checking your browser", "Ray ID: ...").
         cf_signals = (
-            "just a moment", "checking your browser", "ray id", "cloudflare",
+            "just a moment", "checking your browser", "ray id",
             "please wait while we verify", "unusual activity", "captcha",
             "recaptcha", "verify you are human", "verify you are not a robot",
             "please complete the security check", "access denied",
