@@ -17,7 +17,7 @@ pytest.importorskip("crawl4ai.browser_adapter")
 from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
 from crawl4ai.browser_adapter import UndetectedAdapter
 
-from hyperresearch.web.crawl4ai_provider import Crawl4AIProvider
+from hyperresearch.web.crawl4ai_provider import MANAGED_KEYCHAIN_ARGS, Crawl4AIProvider
 
 
 def test_make_crawler_uses_undetected_adapter() -> None:
@@ -47,3 +47,20 @@ def test_undetected_wiring_survives_profile_path() -> None:
 
     assert isinstance(crawler.crawler_strategy.adapter, UndetectedAdapter)
     assert crawler.crawler_strategy.browser_manager.use_undetected is True
+
+
+def test_profile_path_uses_mock_keychain() -> None:
+    """A login profile switches crawl4ai to its managed browser, which skips
+    Playwright's default switches. Without the mock keychain, every launch on
+    macOS raises a keychain prompt."""
+    provider = Crawl4AIProvider(headless=True, user_data_dir="/tmp/does-not-matter")
+
+    for flag in MANAGED_KEYCHAIN_ARGS:
+        assert flag in provider._browser_config.extra_args
+
+
+def test_plain_path_leaves_extra_args_alone() -> None:
+    """Without a profile, Playwright's own launch already passes the flags."""
+    provider = Crawl4AIProvider(headless=True)
+
+    assert not provider._browser_config.extra_args

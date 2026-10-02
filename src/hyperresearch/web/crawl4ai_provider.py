@@ -118,6 +118,12 @@ def _smart_wait_js(settings: FetchSettings) -> str:
 # BrowserConfig(ignore_https_errors=False) alone verifies nothing: checked
 # against a self-signed server on crawl4ai 0.8.6, the page loads either way
 # until these are removed as well.
+# The managed (login-profile) browser is launched by crawl4ai itself, without
+# Playwright's default switches. On macOS each launch then asks the login
+# keychain for "Chrome Safe Storage", and parallel fetchers stack up prompts
+# that cannot be answered. crawl4ai creates its profiles with these flags too.
+MANAGED_KEYCHAIN_ARGS = ("--use-mock-keychain", "--password-store=basic")
+
 _CERT_IGNORE_FLAGS = frozenset({
     "--ignore-certificate-errors",
     "--ignore-certificate-errors-spki-list",
@@ -251,6 +257,7 @@ class Crawl4AIProvider:
         if data_dir:
             browser_kwargs["use_managed_browser"] = True
             browser_kwargs["user_data_dir"] = data_dir
+            browser_kwargs["extra_args"] = list(MANAGED_KEYCHAIN_ARGS)
         if cookies:
             browser_kwargs["cookies"] = cookies
         # crawl4ai defaults ignore_https_errors to True; verify unless the
