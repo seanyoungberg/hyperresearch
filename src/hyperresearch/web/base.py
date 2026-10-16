@@ -196,6 +196,34 @@ def get_provider(
     settings: FetchSettings | None = None,
     gates: JunkGates | None = None,
 ) -> WebProvider:
+    """Load a web provider by name, wrapped in the open site routes.
+
+    For the browser providers (builtin, crawl4ai), Reddit, X, YouTube and
+    Hacker News URLs go through their keyless APIs first
+    (``hyperresearch.web.site_routes``); everything else, and any route that
+    fails, reaches the provider unchanged. The paid API providers fetch through
+    their vendor and are returned as they are. Set
+    ``HYPERRESEARCH_SITE_ROUTES=0`` to turn the routes off.
+    """
+    import logging
+    import os
+
+    inner = _base_provider(name, profile, magic, headless, settings, gates)
+    if name not in (None, "builtin", "crawl4ai") or os.environ.get("HYPERRESEARCH_SITE_ROUTES", "1") == "0":
+        return inner
+    from hyperresearch.web.site_routes import SiteRoutes
+
+    return SiteRoutes(inner, log=logging.getLogger("hyperresearch.site_routes").warning)
+
+
+def _base_provider(
+    name: str | None,
+    profile: str | None,
+    magic: bool,
+    headless: bool,
+    settings: FetchSettings | None,
+    gates: JunkGates | None,
+) -> WebProvider:
     """Load a web provider by name. Falls back to builtin if none specified."""
     if name is None or name == "builtin":
         from hyperresearch.web.builtin import BuiltinProvider

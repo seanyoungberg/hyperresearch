@@ -94,6 +94,11 @@ Before spawning any fetchers, produce a **search plan** that maps the decomposit
 
 1. **Academic APIs first.** For topics with a research literature, hit Semantic Scholar / arXiv / OpenAlex / PubMed BEFORE web search. Academic APIs return citation-ranked canonical papers.
 
+1b. **Practitioner threads.** When an item turns on what users, builders or operators say (tools, products, workflows, public reaction), web search rarely returns Reddit and Hacker News threads, and Claude's search refuses reddit.com. Ask the archives directly and add the best threads to the queue:
+   - `hyperresearch social reddit "<terms>" -r <subreddit> [-r <subreddit>] --after YYYY-MM-DD -j`: name the subreddits that carry the topic; it searches only inside them. A subreddit listed under `errors` was not searched, so say so rather than treat it as silent.
+   - `hyperresearch social hn "<terms>" --after YYYY-MM-DD -j`
+   Fetching a Reddit, X, YouTube or Hacker News URL needs nothing special: `fetch` and `fetch-batch` read the thread, post or transcript through open APIs and fall back to the browser only if those fail. X has no search route; X posts arrive only as links other sources cite.
+
 2. **Web searches from the plan.** Execute ALL planned searches across all three lenses. Aim for **<< p.candidate_urls|dash >> candidate URLs** before deduplication for `full` tier.
 
 3. **Build and deduplicate the master URL queue.** Remove exact-URL duplicates. Remove obvious junk domains. The deduplicated queue should have **<< p.deduped_urls|dash >> URLs** for `full` tier.
